@@ -110,7 +110,7 @@ impl PetApp {
     fn handle_add_pet_submission(&mut self, ctx: &egui::Context) {
         let add_form = &mut self.app_state.add_form;
         if let Ok(pet) = add_form.to_pet() {
-            let kind = pet.clone().inner().3;
+            let pet_clone = pet.clone().inner();
             let _ = self.backend_event_sender.send(Event::DBInsertPet(
                 ctx.clone(),
                 self.db_con.clone(),
@@ -118,7 +118,7 @@ impl PetApp {
             ));
             let _ = self
                 .backend_event_sender
-                .send(Event::GetPetImage(ctx.clone(), kind));
+                .send(Event::GetPetImage(ctx.clone(), pet_clone.3));
             self.app_state.clear_add_form();
         }
     }
@@ -152,12 +152,7 @@ impl PetApp {
                 Event::SetPetImage(pet_image) => self.app_state.pet_image = pet_image,
                 Event::SetSelectedPet(pet) => self.app_state.selected_pet = pet,
                 Event::SetPets(pets) => {
-                    if let Some(ref selected_pet) = self.app_state.selected_pet {
-                        if pets.iter().all(|p| p.id() != selected_pet.id()) {
-                            self.app_state.selected_pet = None;
-                        }
-                    }
-                    self.app_state.pets = pets
+                    self.app_state.update_pets(pets);
                 }
                 _ => (),
             }
@@ -188,9 +183,6 @@ impl AppState {
 }
 
 impl AddForm {
-    fn inner(self) -> (String, String, String) {
-        (self.name, self.age, self.kind)
-    }
     fn to_pet(&self) -> Result<Pet> {
         let name = self.name.clone();
         let age = self
@@ -205,59 +197,111 @@ impl AddForm {
     }
 }
 
-pub struct EventHandler {
-    event_sender: Sender<Event>,
-    event_receiber: Receiver<Event>,
-    db_con: SqlCon,
+// Handle backend, send request of render side
+pub enum BackendEvent {
+    FetchPetImage(egui::Context, PetKind),
+    GetPetDB(egui::Context, SqlCon, i64),
+    InsertPetDB(egui::Context, SqlCon, Pet),
+    DeletePetDB(egui::Context, SqlCon, i64), // Sql Connection, pet_id
 }
 
-pub enum Event {
+// Handle render side, send request to backend
+pub enum RenderEvent {
     SetPets(Vec<Pet>),
-    GetPetImage(egui::Context, PetKind),
     SetPetImage(Option<String>),
-    DBGetPet(egui::Context, SqlCon, i64), // Sql Connection; pet_id
     SetSelectedPet(Option<Pet>),
-    DBInsertPet(egui::Context, SqlCon, Pet),
-    DBDeletePet(egui::Context, SqlCon, i64), // Sql Connection, pet_id
 }
 
-impl Event {
-    pub fn handle_op(self, sender: Sender<Event>) {
-        match self {
-            Event::GetPetImage(ctx, pet_kind) => {
-                fetch_pet_image(ctx, pet_kind, sender);
-            }
-            Event::DBGetPet(ctx, db_con, pet_id) => {
-                if let Ok(Some(pet)) = db_get_pet(db_con, pet_id) {
-                    let _ = sender.send(Event::SetSelectedPet(Some(pet)));
-                    ctx.request_repaint();
-                }
-            }
-            Event::DBDeletePet(ctx, db_con, pet_id) => db_delete_pet(db_con.clone(), pet_id)
-                .and_then(|_| {
-                    if let Ok(pets) = db_get_pets(db_con) {
-                        let _ = sender.send(Event::SetPets(pets));
-                        ctx.request_repaint();
-                    }
-                    Ok(())
-                })
-                .unwrap_or_else(|_| ()),
-            Event::DBInsertPet(ctx, db_con, pet) => db_insert_pet(db_con.clone(), pet)
-                .and_then(|new_pet| {
-                    if let Ok(pets) = db_get_pets(db_con) {
-                        let _ = sender.send(Event::SetPets(pets));
-                        let _ = sender.send(Event::SetSelectedPet(Some(new_pet)));
-                        ctx.request_repaint();
-                    }
-                    Ok(())
-                })
-                .unwrap_or_else(|_| ()),
-            _ => (),
+// T for Sender, U for receiver
+trait EventHandle {
+    type RecvEvent;
+    fn handle(&mut self, recv_event: Self::RecvEvent);
+    fn handle_stream(&mut self, receiver: Receiver<Self::RecvEvent>) {
+        while let Ok(event) = receiver.recv() {
+            self.handle(event);
         }
     }
 }
 
-pub fn fetch_pet_image(ctx: egui::Context, pet_kind: PetKind, sender: Sender<Event>) {
+pub struct Handler<T, U, C> {
+    sender: Sender<T>,
+    receiver: Receiver<U>,
+    state: C,
+}
+
+impl<T, U, C> Handler<T, U, C> {
+    pub fn new(sender: Sender<T>, receiver: Receiver<U>, state: C) -> Handler<T, U, C> {
+        Handler {
+            sender,
+            receiver,
+            state,
+        }
+    }
+}
+
+// Render Handler
+impl EventHandle for Handler<BackendEvent, RenderEvent, AppState> {
+    type RecvEvent = RenderEvent;
+    fn handle(&mut self, event: RenderEvent) {
+        match event {
+            RenderEvent::SetPets(pets) => {
+                // Update the app state with the new pet list
+                self.state.update_pets(pets);
+            }
+            RenderEvent::SetPetImage(pet_image) => {
+                // Update the displayed pet image
+                self.state.pet_image = pet_image;
+            }
+            RenderEvent::SetSelectedPet(pet) => {
+                // Update the selected pet details
+                self.state.selected_pet = pet;
+            }
+        }
+    }
+}
+
+// Backend Handler
+impl EventHandle for Handler<RenderEvent, BackendEvent, SqlCon> {
+    type RecvEvent = BackendEvent;
+    fn handle(&mut self, event: BackendEvent) {
+        match event {
+            BackendEvent::FetchPetImage(ctx, pet_kind) => {
+                fetch_pet_image(ctx, pet_kind, self.sender.clone());
+            }
+            BackendEvent::GetPetDB(ctx, db_con, pet_id) => {
+                if let Ok(Some(pet)) = db_get_pet(db_con, pet_id) {
+                    let _ = self.sender.send(RenderEvent::SetSelectedPet(Some(pet)));
+                    ctx.request_repaint();
+                }
+            }
+            BackendEvent::DeletePetDB(ctx, db_con, pet_id) => {
+                db_delete_pet(db_con.clone(), pet_id)
+                    .and_then(|_| {
+                        if let Ok(pets) = db_get_pets(db_con) {
+                            let _ = self.sender.send(RenderEvent::SetPets(pets));
+                            ctx.request_repaint();
+                        }
+                        Ok(())
+                    })
+                    .unwrap_or_else(|_| ());
+            }
+            BackendEvent::InsertPetDB(ctx, db_con, pet) => {
+                db_insert_pet(db_con.clone(), pet)
+                    .and_then(|new_pet| {
+                        if let Ok(pets) = db_get_pets(db_con) {
+                            let _ = self.sender.send(RenderEvent::SetPets(pets));
+                            let _ = self.sender.send(RenderEvent::SetSelectedPet(Some(new_pet)));
+                            ctx.request_repaint();
+                        }
+                        Ok(())
+                    })
+                    .unwrap_or_else(|_| ());
+            }
+        }
+    }
+}
+
+fn fetch_pet_image(ctx: egui::Context, pet_kind: PetKind, sender: Sender<RenderEvent>) {
     let url = if pet_kind.inner() == "dog" {
         DOG_API
     } else {
@@ -277,8 +321,54 @@ pub fn fetch_pet_image(ctx: egui::Context, pet_kind: PetKind, sender: Sender<Eve
                 },
             };
 
-            let _ = sender.send(Event::SetPetImage(img_url));
+            let _ = sender.send(RenderEvent::SetPetImage(img_url));
             ctx.request_repaint();
         }
     });
+}
+
+pub enum Event {
+    SetPets(Vec<Pet>),
+    GetPetImage(egui::Context, PetKind),
+    SetPetImage(Option<String>),
+    DBGetPet(egui::Context, SqlCon, i64), // Sql Connection; pet_id
+    SetSelectedPet(Option<Pet>),
+    DBInsertPet(egui::Context, SqlCon, Pet),
+    DBDeletePet(egui::Context, SqlCon, i64), // Sql Connection, pet_id
+}
+
+impl Event {
+    pub fn handle_op(self, render_sender: Sender<Event>) {
+        match self {
+            Event::GetPetImage(ctx, pet_kind) => {
+                fetch_pet_image(ctx, pet_kind, render_sender);
+            }
+            Event::DBGetPet(ctx, db_con, pet_id) => {
+                if let Ok(Some(pet)) = db_get_pet(db_con, pet_id) {
+                    let _ = render_sender.send(Event::SetSelectedPet(Some(pet)));
+                    ctx.request_repaint();
+                }
+            }
+            Event::DBDeletePet(ctx, db_con, pet_id) => db_delete_pet(db_con.clone(), pet_id)
+                .and_then(|_| {
+                    if let Ok(pets) = db_get_pets(db_con) {
+                        let _ = render_sender.send(Event::SetPets(pets));
+                        ctx.request_repaint();
+                    }
+                    Ok(())
+                })
+                .unwrap_or_else(|_| ()),
+            Event::DBInsertPet(ctx, db_con, pet) => db_insert_pet(db_con.clone(), pet)
+                .and_then(|new_pet| {
+                    if let Ok(pets) = db_get_pets(db_con) {
+                        let _ = render_sender.send(Event::SetPets(pets));
+                        let _ = render_sender.send(Event::SetSelectedPet(Some(new_pet)));
+                        ctx.request_repaint();
+                    }
+                    Ok(())
+                })
+                .unwrap_or_else(|_| ()),
+            _ => (),
+        }
+    }
 }
