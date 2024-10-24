@@ -1,10 +1,10 @@
-use std::sync::{
-    mpsc::{Receiver, Sender},
-    Arc,
-};
+use std::sync::mpsc::{Receiver, Sender};
 
 use anyhow::{anyhow, Result};
-use eframe::egui::{self, mutex::Mutex};
+use eframe::{
+    egui::{self},
+    egui_glow::painter::clear,
+};
 
 use super::{
     item::{CatJSON, DogJSON, Pet, PetKind},
@@ -15,20 +15,20 @@ const DOG_API: &str = "https://dog.ceo/api/breeds/image/random";
 const CAT_API: &str = "https://api.thecatapi.com/v1/images/search";
 
 impl eframe::App for PetApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.handle_egui();
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render_handler.handle_stream();
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_sidebar(ui, ctx);
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                self.render_detail(ui, ctx);
+            })
         });
     }
 }
 
 pub struct PetApp {
-    app_state: AppState,
-    backend_event_sender: Sender<Event>,
-    event_receiver: Receiver<Event>,
-    db_con: SqlCon,
+    render_handler: Handler<BackendEvent, RenderEvent, AppState>,
 }
 #[derive(Debug, Clone, Default)]
 struct AppState {
@@ -39,7 +39,7 @@ struct AppState {
 }
 #[derive(Debug, Clone, Default)]
 struct AddForm {
-    pub show: bool,
+    show: bool,
     name: String,
     age: String,
     kind: String,
@@ -47,20 +47,25 @@ struct AddForm {
 
 impl PetApp {
     pub fn new(
-        backend_event_sender: Sender<Event>,
-        event_receiver: Receiver<Event>,
-        db_con: sqlite::Connection,
-    ) -> Result<Box<PetApp>> {
-        let db_con = Arc::new(Mutex::new(db_con));
-        let pets = db_get_pets(db_con.clone())?;
-        Ok(Box::new(Self {
-            app_state: AppState::new(pets),
-            backend_event_sender,
-            event_receiver,
-            db_con,
-        }))
+        backend_sender: Sender<BackendEvent>,
+        render_receiver: Receiver<RenderEvent>,
+    ) -> Box<PetApp> {
+        let app_state = AppState::default();
+        let handler = Handler::new(backend_sender, render_receiver, app_state);
+        Box::new(PetApp {
+            render_handler: handler,
+        })
     }
 
+    fn state(&mut self) -> &mut AppState {
+        &mut self.render_handler.state
+    }
+
+    fn send(&self, event: BackendEvent) {
+        let _ = self.render_handler.sender.send(event);
+    }
+
+    // Sidebar logic
     fn render_sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::SidePanel::left("left panel")
             .resizable(false)
@@ -77,9 +82,9 @@ impl PetApp {
             ui.heading("Pets");
             ui.separator();
             if ui.button("Add new Pet").clicked() {
-                self.app_state.add_form.show = !self.app_state.add_form.show;
+                self.state().add_form.show = !self.state().add_form.show;
             }
-            if self.app_state.add_form.show {
+            if self.state().add_form.show {
                 ui.separator();
                 self.render_add_form(ui, ctx);
             }
@@ -96,9 +101,9 @@ impl PetApp {
                 });
                 ui.end_row();
                 ui.vertical(|ui| {
-                    ui.text_edit_singleline(&mut self.app_state.add_form.name);
-                    ui.text_edit_singleline(&mut self.app_state.add_form.age);
-                    ui.text_edit_singleline(&mut self.app_state.add_form.kind);
+                    ui.text_edit_singleline(&mut self.state().add_form.name);
+                    ui.text_edit_singleline(&mut self.state().add_form.age);
+                    ui.text_edit_singleline(&mut self.state().add_form.kind);
                 });
             });
             if ui.button("Submit").clicked() {
@@ -108,66 +113,78 @@ impl PetApp {
     }
 
     fn handle_add_pet_submission(&mut self, ctx: &egui::Context) {
-        let add_form = &mut self.app_state.add_form;
+        let add_form = &mut self.state().add_form;
         if let Ok(pet) = add_form.to_pet() {
             let pet_clone = pet.clone().inner();
-            let _ = self.backend_event_sender.send(Event::DBInsertPet(
-                ctx.clone(),
-                self.db_con.clone(),
-                pet,
-            ));
-            let _ = self
-                .backend_event_sender
-                .send(Event::GetPetImage(ctx.clone(), pet_clone.3));
-            self.app_state.clear_add_form();
+            let _ = self.send(BackendEvent::InsertPetDB(ctx.clone(), pet));
+            let _ = self.send(BackendEvent::FetchPetImage(ctx.clone(), pet_clone.3));
+            self.state().clear_add_form();
         }
     }
 
     fn render_pet_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        self.app_state.pets.iter().for_each(|pet| {
+        let state = &mut self.render_handler.state;
+        let sender = &self.render_handler.sender;
+
+        state.pets.iter().for_each(|pet| {
             let pet_clone = pet.clone().inner();
             if ui
-                .selectable_value(
-                    &mut self.app_state.selected_pet,
-                    Some(pet.to_owned()),
-                    pet_clone.1,
-                )
+                .selectable_value(&mut state.selected_pet, Some(pet.to_owned()), pet_clone.1)
                 .changed()
             {
-                let _ = self.backend_event_sender.send(Event::DBGetPet(
-                    ctx.clone(),
-                    self.db_con.clone(),
-                    pet.id(),
-                ));
-                let _ = self
-                    .backend_event_sender
-                    .send(Event::GetPetImage(ctx.clone(), pet_clone.3));
+                let _ = sender.send(BackendEvent::GetPetDB(ctx.clone(), pet.id()));
+                let _ = sender.send(BackendEvent::FetchPetImage(ctx.clone(), pet_clone.3));
             }
         });
     }
 
-    pub fn handle_egui(&mut self) {
-        while let Ok(event) = self.event_receiver.try_recv() {
-            match event {
-                Event::SetPetImage(pet_image) => self.app_state.pet_image = pet_image,
-                Event::SetSelectedPet(pet) => self.app_state.selected_pet = pet,
-                Event::SetPets(pets) => {
-                    self.app_state.update_pets(pets);
-                }
-                _ => (),
+    // Inside Logic
+    fn render_detail(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let selected_pet = &self.render_handler.state.selected_pet;
+        let pet_img = &self.render_handler.state.pet_image;
+        ui.vertical_centered(|ui| {
+            ui.heading("Details");
+            if let Some(pet) = selected_pet {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            let _ = self.send(BackendEvent::DeletePetDB(ctx.clone(), pet.id()));
+                        }
+                    })
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label("id:");
+                            ui.label("name:");
+                            ui.label("age:");
+                            ui.label("kind");
+                        });
+                        ui.end_row();
+                        ui.vertical(|ui| {
+                            let pet_clone = pet.clone().inner();
+                            ui.label(pet_clone.0.to_string());
+                            ui.label(pet_clone.1);
+                            ui.label(pet_clone.2.to_string());
+                            ui.label(pet_clone.3.inner());
+                        });
+                    });
+                    ui.separator();
+                    if let Some(ref pet_img) = pet_img {
+                        ui.add(egui::Image::from_uri(pet_img).max_width(200.0));
+                    }
+                });
+            } else {
+                ui.label("No pet selected.");
             }
-        }
+        });
     }
+
+    fn render_delete_button(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {}
 }
 
 impl AppState {
-    fn new(pets: Vec<Pet>) -> Self {
-        Self {
-            pets,
-            ..Default::default()
-        }
-    }
-
     fn update_pets(&mut self, pets: Vec<Pet>) {
         if let Some(ref selected_pet) = self.selected_pet {
             if pets.iter().all(|p| p.id() != selected_pet.id()) {
@@ -199,10 +216,11 @@ impl AddForm {
 
 // Handle backend, send request of render side
 pub enum BackendEvent {
+    // ctx for repaint
     FetchPetImage(egui::Context, PetKind),
-    GetPetDB(egui::Context, SqlCon, i64),
-    InsertPetDB(egui::Context, SqlCon, Pet),
-    DeletePetDB(egui::Context, SqlCon, i64), // Sql Connection, pet_id
+    GetPetDB(egui::Context, i64),
+    InsertPetDB(egui::Context, Pet),
+    DeletePetDB(egui::Context, i64),
 }
 
 // Handle render side, send request to backend
@@ -213,14 +231,10 @@ pub enum RenderEvent {
 }
 
 // T for Sender, U for receiver
-trait EventHandle {
+pub trait EventHandle {
     type RecvEvent;
     fn handle(&mut self, recv_event: Self::RecvEvent);
-    fn handle_stream(&mut self, receiver: Receiver<Self::RecvEvent>) {
-        while let Ok(event) = receiver.recv() {
-            self.handle(event);
-        }
-    }
+    fn handle_stream(&mut self);
 }
 
 pub struct Handler<T, U, C> {
@@ -258,6 +272,12 @@ impl EventHandle for Handler<BackendEvent, RenderEvent, AppState> {
             }
         }
     }
+
+    fn handle_stream(&mut self) {
+        while let Ok(event) = self.receiver.try_recv() {
+            self.handle(event);
+        }
+    }
 }
 
 // Backend Handler
@@ -268,16 +288,16 @@ impl EventHandle for Handler<RenderEvent, BackendEvent, SqlCon> {
             BackendEvent::FetchPetImage(ctx, pet_kind) => {
                 fetch_pet_image(ctx, pet_kind, self.sender.clone());
             }
-            BackendEvent::GetPetDB(ctx, db_con, pet_id) => {
-                if let Ok(Some(pet)) = db_get_pet(db_con, pet_id) {
+            BackendEvent::GetPetDB(ctx, pet_id) => {
+                if let Ok(Some(pet)) = db_get_pet(self.state.clone(), pet_id) {
                     let _ = self.sender.send(RenderEvent::SetSelectedPet(Some(pet)));
                     ctx.request_repaint();
                 }
             }
-            BackendEvent::DeletePetDB(ctx, db_con, pet_id) => {
-                db_delete_pet(db_con.clone(), pet_id)
+            BackendEvent::DeletePetDB(ctx, pet_id) => {
+                db_delete_pet(self.state.clone(), pet_id)
                     .and_then(|_| {
-                        if let Ok(pets) = db_get_pets(db_con) {
+                        if let Ok(pets) = db_get_pets(self.state.clone()) {
                             let _ = self.sender.send(RenderEvent::SetPets(pets));
                             ctx.request_repaint();
                         }
@@ -285,10 +305,10 @@ impl EventHandle for Handler<RenderEvent, BackendEvent, SqlCon> {
                     })
                     .unwrap_or_else(|_| ());
             }
-            BackendEvent::InsertPetDB(ctx, db_con, pet) => {
-                db_insert_pet(db_con.clone(), pet)
+            BackendEvent::InsertPetDB(ctx, pet) => {
+                db_insert_pet(self.state.clone(), pet)
                     .and_then(|new_pet| {
-                        if let Ok(pets) = db_get_pets(db_con) {
+                        if let Ok(pets) = db_get_pets(self.state.clone()) {
                             let _ = self.sender.send(RenderEvent::SetPets(pets));
                             let _ = self.sender.send(RenderEvent::SetSelectedPet(Some(new_pet)));
                             ctx.request_repaint();
@@ -297,6 +317,15 @@ impl EventHandle for Handler<RenderEvent, BackendEvent, SqlCon> {
                     })
                     .unwrap_or_else(|_| ());
             }
+        }
+    }
+    fn handle_stream(&mut self) {
+        if let Ok(pets) = db_get_pets(self.state.clone()) {
+            let _ = self.sender.send(RenderEvent::SetPets(pets));
+        }
+
+        while let Ok(event) = self.receiver.recv() {
+            self.handle(event);
         }
     }
 }
@@ -325,50 +354,4 @@ fn fetch_pet_image(ctx: egui::Context, pet_kind: PetKind, sender: Sender<RenderE
             ctx.request_repaint();
         }
     });
-}
-
-pub enum Event {
-    SetPets(Vec<Pet>),
-    GetPetImage(egui::Context, PetKind),
-    SetPetImage(Option<String>),
-    DBGetPet(egui::Context, SqlCon, i64), // Sql Connection; pet_id
-    SetSelectedPet(Option<Pet>),
-    DBInsertPet(egui::Context, SqlCon, Pet),
-    DBDeletePet(egui::Context, SqlCon, i64), // Sql Connection, pet_id
-}
-
-impl Event {
-    pub fn handle_op(self, render_sender: Sender<Event>) {
-        match self {
-            Event::GetPetImage(ctx, pet_kind) => {
-                fetch_pet_image(ctx, pet_kind, render_sender);
-            }
-            Event::DBGetPet(ctx, db_con, pet_id) => {
-                if let Ok(Some(pet)) = db_get_pet(db_con, pet_id) {
-                    let _ = render_sender.send(Event::SetSelectedPet(Some(pet)));
-                    ctx.request_repaint();
-                }
-            }
-            Event::DBDeletePet(ctx, db_con, pet_id) => db_delete_pet(db_con.clone(), pet_id)
-                .and_then(|_| {
-                    if let Ok(pets) = db_get_pets(db_con) {
-                        let _ = render_sender.send(Event::SetPets(pets));
-                        ctx.request_repaint();
-                    }
-                    Ok(())
-                })
-                .unwrap_or_else(|_| ()),
-            Event::DBInsertPet(ctx, db_con, pet) => db_insert_pet(db_con.clone(), pet)
-                .and_then(|new_pet| {
-                    if let Ok(pets) = db_get_pets(db_con) {
-                        let _ = render_sender.send(Event::SetPets(pets));
-                        let _ = render_sender.send(Event::SetSelectedPet(Some(new_pet)));
-                        ctx.request_repaint();
-                    }
-                    Ok(())
-                })
-                .unwrap_or_else(|_| ()),
-            _ => (),
-        }
-    }
 }
