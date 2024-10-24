@@ -177,6 +177,8 @@ impl PetApp {
             }
         });
     }
+
+    fn render_delete_button(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {}
 }
 
 impl AppState {
