@@ -84,7 +84,7 @@ impl PetApp {
         });
     }
 
-    // Sidebar 
+    // Sidebar
     fn render_sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::SidePanel::left("left panel")
             .resizable(false)
@@ -96,7 +96,7 @@ impl PetApp {
             });
     }
 
-    // Sidebar -> Header 
+    // Sidebar -> Header
     fn render_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.vertical_centered(|ui| {
             ui.heading("Pets");
@@ -171,7 +171,6 @@ impl PetApp {
                 let pet_clone = pet.clone().inner();
                 ui.vertical(|ui| {
                     Self::ui_label_info_column(ui, &["name:", "age:", "kind"], |ui| {
-                        ui.label(pet_clone.0.to_string());
                         ui.label(pet_clone.1);
                         ui.label(pet_clone.2.to_string());
                         ui.label(pet_clone.3.inner());
