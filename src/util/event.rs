@@ -62,7 +62,29 @@ impl PetApp {
         let _ = self.render_handler.sender.send(event);
     }
 
-    // Sidebar logic
+    fn ui_label_column(ui: &mut egui::Ui, labels: &[&str]) {
+        ui.vertical(|ui| {
+            for label in labels {
+                ui.label(*label);
+            }
+        });
+    }
+
+    fn ui_label_info_column(
+        ui: &mut egui::Ui,
+        labels: &[&str],
+        content: impl FnOnce(&mut egui::Ui),
+    ) {
+        ui.horizontal(|ui| {
+            Self::ui_label_column(ui, labels);
+            ui.end_row();
+            ui.vertical(|ui| {
+                content(ui);
+            });
+        });
+    }
+
+    // Sidebar 
     fn render_sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::SidePanel::left("left panel")
             .resizable(false)
@@ -74,6 +96,7 @@ impl PetApp {
             });
     }
 
+    // Sidebar -> Header 
     fn render_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.vertical_centered(|ui| {
             ui.heading("Pets");
@@ -88,20 +111,14 @@ impl PetApp {
         });
     }
 
+    // Sidebar -> AddForm
     fn render_add_form(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.vertical_centered(|ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label("name:");
-                    ui.label("age:");
-                    ui.label("kind:");
-                });
-                ui.end_row();
-                ui.vertical(|ui| {
-                    ui.text_edit_singleline(&mut self.state().add_form.name);
-                    ui.text_edit_singleline(&mut self.state().add_form.age);
-                    ui.text_edit_singleline(&mut self.state().add_form.kind);
-                });
+            let add_form = &mut self.state().add_form;
+            Self::ui_label_info_column(ui, &["name:", "age:", "kind:"], |ui| {
+                ui.text_edit_singleline(&mut add_form.name);
+                ui.text_edit_singleline(&mut add_form.age);
+                ui.text_edit_singleline(&mut add_form.kind);
             });
             if ui.button("Submit").clicked() {
                 self.handle_add_pet_submission(ctx);
@@ -119,6 +136,7 @@ impl PetApp {
         }
     }
 
+    // Sidebar -> PetList
     fn render_pet_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let state = &mut self.render_handler.state;
         let sender = &self.render_handler.sender;
@@ -135,7 +153,7 @@ impl PetApp {
         });
     }
 
-    // Inside Logic
+    // Details
     fn render_detail(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let selected_pet = &self.render_handler.state.selected_pet;
         let pet_img = &self.render_handler.state.pet_image;
@@ -150,22 +168,13 @@ impl PetApp {
                     })
                 });
                 ui.separator();
+                let pet_clone = pet.clone().inner();
                 ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label("id:");
-                            ui.label("name:");
-                            ui.label("age:");
-                            ui.label("kind");
-                        });
-                        ui.end_row();
-                        ui.vertical(|ui| {
-                            let pet_clone = pet.clone().inner();
-                            ui.label(pet_clone.0.to_string());
-                            ui.label(pet_clone.1);
-                            ui.label(pet_clone.2.to_string());
-                            ui.label(pet_clone.3.inner());
-                        });
+                    Self::ui_label_info_column(ui, &["name:", "age:", "kind"], |ui| {
+                        ui.label(pet_clone.0.to_string());
+                        ui.label(pet_clone.1);
+                        ui.label(pet_clone.2.to_string());
+                        ui.label(pet_clone.3.inner());
                     });
                     ui.separator();
                     if let Some(ref pet_img) = pet_img {
@@ -177,8 +186,6 @@ impl PetApp {
             }
         });
     }
-
-    fn render_delete_button(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {}
 }
 
 impl AppState {
